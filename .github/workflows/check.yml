@@ -1,0 +1,19 @@
+name: Source checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Unit tests (no GPU, no model, no API secret)
+        run: python -B -m unittest discover -s tests -v
+      - name: Source, provenance and release safety
+        run: python -B scripts/verify_repo.py --tracked
+      - name: Bash syntax
+        run: bash -n scripts/install.sh

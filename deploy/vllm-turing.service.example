@@ -1,0 +1,22 @@
+# 可选模板：管理员审核路径和 User 后手动安装。本项目不会自动修改 systemd。
+# 请勿同时使用 manage.py start 和 systemd 管理同一实例。
+[Unit]
+Description=vLLM Turing SM75 native inference
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_LINUX_USER
+WorkingDirectory=/opt/vllm-turing-sm75-deploy
+ExecStart=/usr/bin/python3 /opt/vllm-turing-sm75-deploy/scripts/manage.py run
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=120
+KillSignal=SIGTERM
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

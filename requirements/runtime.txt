@@ -1,0 +1,11 @@
+# 与已验证部署一致的主要依赖；通过 uv --override 处理 FlashInfer 偏离。
+vllm==0.30.0
+torch==2.13.0
+flashinfer-python==0.7.0
+flashinfer-cubin==0.7.0
+nccl-extensions==0.1.0
+transformers==5.15.1
+tokenizers==0.22.2
+ninja==1.13.2
+setuptools==80.10.2
+wheel==0.48.0
