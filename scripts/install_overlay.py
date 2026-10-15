@@ -37,7 +37,8 @@ def main():
     venv = ROOT / ".venv"
     if venv.is_symlink() or Path(sys.prefix).resolve() != venv.resolve():
         raise RuntimeError("Use this project's .venv/bin/python; refusing to modify another environment")
-    for name, expected in {"vllm": "0.30.0", "transformers": "5.15.1", "torch": "2.13.0"}.items():
+    for name, expected in {"vllm": "0.31.0", "transformers": "5.15.1", "torch": "2.13.0",
+                           "flashinfer-python": "0.7.0.post1", "flashinfer-cubin": "0.7.0.post1"}.items():
         if importlib.metadata.version(name).split("+")[0] != expected:
             raise RuntimeError(f"Unexpected {name} version")
     for name in ("PYTHONHOME", "PYTHONPATH"):

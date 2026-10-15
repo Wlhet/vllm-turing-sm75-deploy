@@ -7,6 +7,8 @@ from __future__ import annotations
 from typing import ClassVar, cast
 
 import torch
+_S3LOGGED = False
+_S4LOGGED = False
 from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
@@ -25,6 +27,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
@@ -71,18 +74,44 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
     # 加 fp8_e4m3: 全局 --kv-cache-dtype fp8_e4m3 时 QSA 主 KV 走 fp8 存储
     # (见 Qwen4ExpQSAFlashAttentionImpl / Qwen4ExpQSAAttention 的 fp8 处理)。
+    # e4m3 bytes in a uint8 cache, written by reshape_and_cache with the layer's
+    # per-tensor scales and dequantized on load inside the QSA Triton kernel.
+    # flash-attn never runs over this cache, so its fp8 probe does not apply.
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "bfloat16",
+        "fp8",
         "fp8_e4m3",
     ]
+
+    @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+        return kv_cache_dtype is None or kv_cache_dtype in cls.supported_kv_cache_dtypes
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        # QSA dequantizes the fp8 KV in its own Triton kernel and never runs
+        # flash-attn over the quantized cache, so the parent's fp8-KV rejection
+        # does not apply and every combination it is handed is accepted here.
+        return None
 
     @staticmethod
     def get_name() -> str:
         return "QWEN4_EXP_QSA_TRITON"
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         # QSA consumes manager pages directly and does not use FA4 paged attention.
         return [MultipleOf(16)]
 
@@ -109,35 +138,53 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     supports_dcp: bool = False
     supports_pcp: bool = False
 
-    def __init__(self, *args, **kwargs) -> None:
-        # fp8_e4m3: 先按 bfloat16 过 FlashAttentionImpl.__init__ —— 其内的
-        # flash_attn_supports_kv_cache_dtype 门 (flash_attn.py) 在 sm75 对 fp8 直接
-        # False→raise (sm75 无 FA3/FA4 fp8 kernel)。但 QSA 不走 FA 的注意力 kernel,
-        # 走自家 Triton kernel (ops/qsa.py, fp8 加载后位运算解码), 该门是误报。
-        # 故用 bfloat16 过构造, 再把真实 dtype 翻回 fp8_e4m3 —— do_kv_cache_update
-        # 据此走 reshape_and_cache_flash 的 fp8 量化写入 (unit k/v scale)。
-        is_e4m3 = (
-            len(args) >= 7 and args[6] == "fp8_e4m3"
-        ) or kwargs.get("kv_cache_dtype") == "fp8_e4m3"
-        if is_e4m3:
-            if len(args) >= 7:
-                args = list(args)
-                args[6] = "bfloat16"
-                args = tuple(args)
-            else:
-                kwargs = {**kwargs, "kv_cache_dtype": "bfloat16"}
-        super().__init__(*args, **kwargs)
-        if is_e4m3:
-            self.kv_cache_dtype = "fp8_e4m3"
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int,
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
+        kv_cache_dtype: str,
+        logits_soft_cap: float | None = None,
+        attn_type: AttentionType = AttentionType.DECODER,
+        kv_sharing_target_layer_name: str | None = None,
+        sinks: torch.Tensor | None = None,
+    ) -> None:
+        # The parent constructor probes flash-attn for quantized-KV support and
+        # raises where it is unavailable (sm75: no FA3/FA4 fp8 kernel; sm120),
+        # but QSA dequantizes fp8 inside its own Triton kernel (uint8 位运算
+        # 解码, ops/qsa.py) and never runs flash-attn over the cache. Hand the
+        # parent "auto" for that probe and restore the real dtype afterwards:
+        # the parent only uses it there, and do_kv_cache_update reads the
+        # attribute at call time.
+        real_kv_cache_dtype = kv_cache_dtype
+        if kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            kv_cache_dtype = "auto"
+        super().__init__(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads,
+            alibi_slopes,
+            sliding_window,
+            kv_cache_dtype,
+            logits_soft_cap,
+            attn_type,
+            kv_sharing_target_layer_name,
+            sinks,
+        )
+        self.kv_cache_dtype = real_kv_cache_dtype
         if not is_flash_attn_varlen_func_available():
             raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
         if self.dcp_world_size != 1:
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
-        if self.kv_cache_dtype not in ("auto", "bfloat16", "fp8_e4m3"):
+        if self.kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires a BF16 or E4M3 main KV cache"
+                "Qwen4Exp QSA requires a BF16 or FP8-e4m3 main KV cache"
             )
         self.supports_quant_query_input = False
 
@@ -175,19 +222,93 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-        # fp8_e4m3 cache 物理张量是 uint8 (原始 fp8 字节)。不 .view(float8_e4m3fn):
+        # sm75: fp8 主 KV 物理张量是 uint8 (原始 fp8 字节)。不 .view(float8_e4m3fn):
         # 那会让 QSA kernel 看到 fp8e4nv 张量, sm75 的 Triton 连 .to(tl.float32)
-        # 的 cast 都在编译期报 "type fp8e4nv not supported in this architecture"。
-        # 改为以 uint8 原样进 kernel, kernel 用 _qsa_fp8e4m3fn_bits_to_fp32 纯位运算
-        # 解码 (uint8 软件解码 fp8_e4m3)。BF16/FP16 cache (原路径) 不动。query 恒为
-        # 激活 dtype (sm75 回退 f16, 其余 bf16)。此 dtype 门与 ops 侧
-        # qsa_sparse_paged_attention 的断言逐元素一致 (契约 C2)。
+        # 的 cast 都在编译期报 "type fp8e4nv not supported"。改为以 uint8 原样进
+        # kernel, ops 侧按 uint8 检测 fp8 并用 _qsa_fp8e4m3fn_bits_to_fp32 位运算
+        # 解码。query 恒为激活 dtype (sm75 回退 f16, 其余 bf16)。未校准 unit
+        # scale (写入 reshape_and_cache_flash 与读出均用 set_default_quant_scales
+        # 的 1.0), k_scale/v_scale 保持 None, ops 侧按 unit 处理 (round-trip 一致)。
+        # dtype 门与 ops 侧 qsa_sparse_paged_attention 逐元素一致 (契约 C2)。
         if query.dtype not in (torch.bfloat16, torch.float16) or key_cache.dtype != value_cache.dtype:
             raise NotImplementedError("Qwen4Exp QSA requires BF16/FP16 query and matching K/V")
         if key_cache.dtype not in (torch.bfloat16, torch.float16, torch.uint8):
             raise NotImplementedError("Qwen4Exp QSA requires a BF16/FP16 or E4M3 main KV cache")
+        k_scale = v_scale = None
 
         from .ops.qsa import qsa_sparse_paged_attention
+        # [step3] SM75 短 ctx FA2 fast path (<=16K, 单请求, env 门控默认开)
+        # 精度: 单进程实测 fa2 vs triton max_abs_diff=4.9e-04 (fp16 噪声级, 无损)
+        import os as _os
+        if (_os.getenv("VLLM_QSA_FAST_SHORT_PREFILL", "1") == "1"
+                and current_platform.is_device_capability(75)
+                and use_prefill_config
+                and num_tokens >= 128
+                and query.shape[1:] == (3, 256)
+                and key_cache.shape[2:] == (1, 256)
+                and query.dtype == torch.float16
+                and attn_metadata.query_start_loc.numel() == 2
+                and 0 < attn_metadata.max_seq_len <= 16384):
+            from .ops.qsa_fast_short_prefill import run as _fa2_run
+            global _S3LOGGED
+            if not _S3LOGGED:
+                _S3LOGGED = True
+                logger.info(
+                    "SM75 QSA short-ctx FA2 enabled: rows=%d msl=%d",
+                    num_tokens, attn_metadata.max_seq_len)
+            # 0.31 KV cache 未校准 unit scale (k_scale=v_scale=None 按 1.0);
+            # fast 版 layer._k_scale 是量化权重 scale, 不可用于 fp8 KV 解码
+            _unit = torch.tensor([1.0], dtype=torch.float32,
+                                device=query.device)
+            _fa2_run(query[:num_tokens], key_cache, value_cache,
+                     logical_indices, attn_metadata.block_table,
+                     attn_metadata.max_seq_len, output_gate[:num_tokens],
+                     output[:num_tokens], k_scale=_unit, v_scale=_unit)
+            return output
+
+        # [step4] SM75 长 ctx FA2 paged fast path (>16K, 单请求, env 默认开)
+        # 精度: fa2-fp8-KV sm75 可编译; 单进程 selected-paged vs triton
+        #       max_abs_diff=4.9e-04 (fp16 噪声级, 无损); fp8→fp16 无损 (fa2 内部)
+        import os as _os4
+        _s4ok = (_os4.getenv("VLLM_QSA_FAST_LONG_PREFILL", "1") == "1"
+                and current_platform.is_device_capability(75)
+                and use_prefill_config
+                and num_tokens >= 128
+                and query.shape[1:] == (3, 256)
+                and key_cache.shape[2:] == (1, 256)
+                and query.dtype == torch.float16
+                and attn_metadata.query_start_loc.numel() == 2
+                and 16384 < attn_metadata.max_seq_len <= 262144
+                and attn_metadata.max_seq_len >= num_tokens
+                and key_cache.shape[1] % 4 == 0
+                and logical_indices.shape[1] == 2052
+                and (
+                    (key_cache.dtype == torch.uint8
+                     and key_cache.stride(0) % (4 * key_cache.stride(1)) == 0
+                     and value_cache.stride(0) % (4 * value_cache.stride(1)) == 0
+                     and key_cache.stride(0) // (4 * key_cache.stride(1))
+                     == value_cache.stride(0) // (4 * value_cache.stride(1)))
+                    or (key_cache.dtype == torch.float16
+                        and key_cache.stride(0)
+                        == key_cache.shape[1] * key_cache.stride(1)
+                        and value_cache.stride(0)
+                        == value_cache.shape[1] * value_cache.stride(1))))
+        if _s4ok:
+            # 0.31 主 KV 未校准 unit scale (host 标量 1.0)
+            if key_cache.dtype == torch.uint8:
+                from .ops.qsa_fast_long_prefill_fp8 import run as _s4_run
+            else:
+                from .ops.qsa_fast_long_prefill import run as _s4_run
+            global _S4LOGGED
+            if not _S4LOGGED:
+                _S4LOGGED = True
+                logger.info("SM75 QSA long-ctx FA2 paged enabled: rows=%d msl=%d",
+                             num_tokens, attn_metadata.max_seq_len)
+            _s4_run(query[:num_tokens], key_cache, value_cache,
+                    logical_indices, attn_metadata.block_table,
+                    attn_metadata.max_seq_len, output_gate[:num_tokens],
+                    output[:num_tokens], k_scale=1.0, v_scale=1.0)
+            return output
 
         qsa_sparse_paged_attention(
             query[:num_tokens],
@@ -198,6 +319,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             token_to_req,
             use_prefill_config,
             output[:num_tokens],
+            k_scale=k_scale,
+            v_scale=v_scale,
             output_gate=output_gate[:num_tokens],
         )
         return output
@@ -229,10 +352,15 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if model_config.dtype not in (torch.bfloat16, torch.float16):
             raise NotImplementedError("Qwen4Exp QSA currently requires BF16 or FP16")
         # 允许 fp8_e4m3: 主 KV 走 fp8 存储, 未校准 (checkpoint 无 k/v_scale) →
-        # unit scale + 告警。激活仍是 BF16。
-        if cache_config.cache_dtype not in ("auto", "bfloat16", "fp8_e4m3"):
+        # unit scale + 告警。激活仍是 BF16/FP16。
+        if cache_config.cache_dtype not in (
+            "auto",
+            "bfloat16",
+            "fp8",
+            "fp8_e4m3",
+        ):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires a BF16 or E4M3 main KV cache"
+                "Qwen4Exp QSA requires a BF16 or FP8-e4m3 main KV cache"
             )
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
@@ -337,9 +465,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # (model dtype)。
         if self.kv_cache_torch_dtype not in (torch.bfloat16, torch.uint8):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires BF16 or E4M3 cache storage"
+                "Qwen4Exp QSA requires BF16 or FP8-e4m3 (uint8) cache storage"
             )
-        if self.kv_cache_dtype == "fp8_e4m3":
+        if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
             # 未校准 (checkpoint 无 k_scale/v_scale): 用 set_default_quant_scales
             # 装的 unit scale (1.0)。E4M3 无 rescale, 绝对值 > 448 的 K/V 会饱和;
             # 用精度换可启动。

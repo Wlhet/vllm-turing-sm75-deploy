@@ -1,1 +1,3 @@
-flashinfer-python==0.7.0
+# 0.31 基线：flashinfer-python 已直接匹配上游 vllm 0.31 的 0.7.0.post1 要求，
+# 无偏离需要覆盖；保留本文件以维持安装脚本契约。
+flashinfer-python==0.7.0.post1

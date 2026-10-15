@@ -24,50 +24,6 @@ from __future__ import annotations
 # 保留注释行), 第二次跑 anchor 仍在会重复注入。probe 必须只在注入后存在。
 INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
     (
-        # cutlass.py: CutlassFP8ScaledMM 的 is_supported 补 fp8 计算能力门控。
-        # 上游只查 is_cuda(): sm75 无 fp8 CUTLASS kernel(scaled_mm_c2x.cu 只编
-        # int8 dispatch), fp8 权重层(modelopt_mixed 27B)运行时才炸
-        # cutlass_scaled_mm_sm75_epilogue 的 dtype CHECK。补 cc>=89 拒绝, 选型
-        # 落到 MarlinFP8ScaledMMLinearKernel (sm75 fp8 已验证路径)。
-        "model_executor/kernels/linear/scaled_mm/cutlass.py",
-        [(
-            'class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):\n'
-            '    def __init__(\n'
-            '        self, c: FP8ScaledMMLinearLayerConfig, layer_param_names: Sequence[str]\n'
-            '    ) -> None:\n'
-            '        self.logical_output_size: int | None = None\n'
-            '        super().__init__(c, layer_param_names)\n'
-            '\n'
-            '    @classmethod\n'
-            '    def is_supported(\n'
-            '        cls, compute_capability: int | None = None\n'
-            '    ) -> tuple[bool, str | None]:\n'
-            '        if not current_platform.is_cuda():\n'
-            '            return False, "requires CUDA."\n'
-            '        return True, None\n',
-            'class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):\n'
-            '    def __init__(\n'
-            '        self, c: FP8ScaledMMLinearLayerConfig, layer_param_names: Sequence[str]\n'
-            '    ) -> None:\n'
-            '        self.logical_output_size: int | None = None\n'
-            '        super().__init__(c, layer_param_names)\n'
-            '\n'
-            '    @classmethod\n'
-            '    def is_supported(\n'
-            '        cls, compute_capability: int | None = None\n'
-            '    ) -> tuple[bool, str | None]:\n'
-            '        if not current_platform.is_cuda():\n'
-            '            return False, "requires CUDA."\n'
-            '        # sm75 无 fp8 CUTLASS kernel, fp8 权重须落 MarlinFP8。\n'
-            '        # 上游调用点常不传 compute_capability, 直接查当前设备。\n'
-            '        cap = current_platform.get_device_capability()\n'
-            '        if cap is not None and (cap.major, cap.minor) < (8, 9):\n'
-            '            return False, "fp8 CUTLASS requires SM89+"\n'
-            '        return True, None\n',
-            'fp8 CUTLASS requires SM89+',
-        )],
-    ),
-    (
         # fix_functionalization: 补 cutlass_scaled_mm 的 defunctionalize 分支。
         # modelopt_mixed(NVFP4 27B) 的 W8A8 fp8 线性层进编译图后, dynamo 对
         # torch.ops._C.cutlass_scaled_mm(out, a, b, ...) 的 mutable out 生成
@@ -254,6 +210,96 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
                 "self.raw_key_cache = QSAKeyStateCache(\n"
                 "            head_size=self.index_head_dim,\n"
                 "            dtype=vllm_config.model_config.dtype,",
+            ),
+            (
+                # step2 cuBLAS indexer 快路径接线: forward 的 prefill 分支, 把单一
+                # qsa_select_paged_prefill 调用改成"先试 cuBLAS(fp16 TC 打分), 失败
+                # 回退 triton"。env VLLM_QSA_FAST_INDEXER 门控(默认关, entrypoint
+                # 显式开), 只命中单请求 prefill; 混合/decode 走原 triton。kernel 在
+                # ops/qsa_fast_indexer.py (files 列表整文件覆盖)。
+                "            prefill_slice = slice(num_decode_tokens, num_tokens)\n"
+                "            qsa_select_paged_prefill(\n"
+                "                q[prefill_slice],\n"
+                "                compressed_key_cache,\n"
+                "                compressed_metadata.block_table[num_decodes:],\n"
+                "                compressed_metadata.query_start_loc[num_decodes:],\n"
+                "                visible_blocks[prefill_slice],\n"
+                "                self.token_topk,\n"
+                "                self.compress_ratio,\n"
+                "                compressed_metadata.max_query_len,\n"
+                "                block_indices[prefill_slice],\n"
+                "                compressed_metadata.max_seq_len,\n"
+                "            )\n",
+                "            prefill_slice = slice(num_decode_tokens, num_tokens)\n"
+                "            # SM75: cuBLAS indexer fast path (VLLM_QSA_FAST_INDEXER 门控, 默认关)\n"
+                "            used_cublas = False\n"
+                "            try:\n"
+                "                from .ops.qsa_fast_indexer import (\n"
+                "                    try_qsa_select_paged_prefill_cublas,\n"
+                "                )\n"
+                "                used_cublas = try_qsa_select_paged_prefill_cublas(\n"
+                "                    q[prefill_slice],\n"
+                "                    compressed_key_cache,\n"
+                "                    compressed_metadata.block_table[num_decodes:],\n"
+                "                    compressed_metadata.query_start_loc[num_decodes:],\n"
+                "                    visible_blocks[prefill_slice],\n"
+                "                    self.token_topk,\n"
+                "                    self.compress_ratio,\n"
+                "                    compressed_metadata.max_query_len,\n"
+                "                    block_indices[prefill_slice],\n"
+                "                    compressed_metadata.max_seq_len,\n"
+                "                    single_request_prefill=(\n"
+                "                        num_decodes == 0 and num_decode_tokens == 0\n"
+                "                        and compressed_metadata.num_prefills == 1\n"
+                "                    ),\n"
+                "                )\n"
+                "            except Exception as _e:\n"
+                "                import logging\n"
+                "                logging.getLogger(__name__).warning(\"QSA cuBLAS indexer fallback: %s\", _e)\n"
+                "            if not used_cublas:\n"
+                "                qsa_select_paged_prefill(\n"
+                "                    q[prefill_slice],\n"
+                "                    compressed_key_cache,\n"
+                "                    compressed_metadata.block_table[num_decodes:],\n"
+                "                    compressed_metadata.query_start_loc[num_decodes:],\n"
+                "                    visible_blocks[prefill_slice],\n"
+                "                    self.token_topk,\n"
+                "                    self.compress_ratio,\n"
+                "                    compressed_metadata.max_query_len,\n"
+                "                    block_indices[prefill_slice],\n"
+                "                    compressed_metadata.max_seq_len,\n"
+                "                )\n",
+                "try_qsa_select_paged_prefill_cublas",
+            ),
+        ],
+    ),
+    (
+        # QSA SM75 fast prefill 两个 FA2 kernel 的 JIT 预热接线 (step3 短 ctx
+        # 首编 ~18s / step4 长 ctx 首编 ~40s, 挪到启动, 首请求不吃 JIT)。warmup
+        # 函数在 qwen4_exp_qsa_warmup.py (files 列表整文件覆盖), 这里只接进
+        # kernel_warmup.py 的 import 块 + 调用处 (kernel_warmup.py 是上游文件,
+        # 不在 files 列表 → 锚点注入)。env 门控 (FLASHINFER_PREFILL /
+        # SELECTED_PAGES_PREFILL 默认开) 与 sm75 判定都在 warmup 函数内部, 非
+        # sm75 / 关 env 时 no-op。
+        "model_executor/warmup/kernel_warmup.py",
+        [
+            (
+                "from vllm.model_executor.warmup.qwen4_exp_qsa_warmup import (\n"
+                "    qwen4_exp_qsa_triton_warmup,\n"
+                ")\n",
+                "from vllm.model_executor.warmup.qwen4_exp_qsa_warmup import (\n"
+                "    qwen4_exp_qsa_triton_warmup,\n"
+                "    qwen4_exp_qsa_fa2_warmup,\n"
+                "    qwen4_exp_qsa_fa2paged_warmup,\n"
+                ")\n",
+                "    qwen4_exp_qsa_fa2_warmup,\n",
+            ),
+            (
+                "        qwen4_exp_qsa_triton_warmup(worker)\n",
+                "        qwen4_exp_qsa_triton_warmup(worker)\n"
+                "        qwen4_exp_qsa_fa2_warmup(worker)\n"
+                "        qwen4_exp_qsa_fa2paged_warmup(worker)\n",
+                "        qwen4_exp_qsa_fa2paged_warmup(worker)\n",
             ),
         ],
     ),
@@ -592,18 +638,50 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
         # 对应 EXL3 侧 get_quant_method 对 visual/vision 前缀返 UnquantizedLinearMethod。
         "model_executor/models/qwen3_5.py",
         [(
+            # anchor 为候选列表: 上游原始版 或 旧注入版 (无条件跳过 visual.*)。
+            # 容器内文件已是旧注入版, 单 anchor 会 count=0 使整个 overlay 失败
+            # 回退镜像旧版; 两候选保证新装镜像与在跑容器都能注入到新版门控。
+            [
+                "    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n"
+                "        loader = AutoWeightsLoader(self)\n"
+                "        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)\n"
+                "\n"
+                "    @classmethod\n"
+                "    def get_mamba_state_dtype_from_config(\n",
+                "    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n"
+                "        # SM75 EXL3: skip visual tower weights (fused qkv name mismatch)\n"
+                "        # 视觉塔 checkpoint 按分开 q/k/v_proj 存, vllm 视觉模块用 fused qkv,\n"
+                "        # 递归 loader 找不到 k_proj 模块会 raise。文本推理不执行视觉塔, 顶层\n"
+                "        # 直接跳过 visual.* 权重 (视觉 qkv 保持随机 init, 不影响文本)。\n"
+                "        if getattr(type(self), \"__name__\", \"\") == \"Qwen3_5ForConditionalGeneration\":\n"
+                "            weights = (\n"
+                "                (n, w) for n, w in weights\n"
+                "                if \"visual\" not in n.split(\".\")\n"
+                "            )\n"
+                "        loader = AutoWeightsLoader(self)\n"
+                "        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)\n"
+                "\n"
+                "    @classmethod\n"
+                "    def get_mamba_state_dtype_from_config(\n",
+            ],
             "    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n"
-            "        loader = AutoWeightsLoader(self)\n"
-            "        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)\n"
-            "\n"
-            "    @classmethod\n"
-            "    def get_mamba_state_dtype_from_config(\n",
-            "    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n"
-            "        # SM75 EXL3: skip visual tower weights (fused qkv name mismatch)\n"
-            "        # 视觉塔 checkpoint 按分开 q/k/v_proj 存, vllm 视觉模块用 fused qkv,\n"
-            "        # 递归 loader 找不到 k_proj 模块会 raise。文本推理不执行视觉塔, 顶层\n"
-            "        # 直接跳过 visual.* 权重 (视觉 qkv 保持随机 init, 不影响文本)。\n"
-            "        if getattr(type(self), \"__name__\", \"\") == \"Qwen3_5ForConditionalGeneration\":\n"
+            "        # SM75 EXL3: 仅 EXL3 checkpoint 跳过视觉塔权重。EXL3 按 MHA 存\n"
+            "        # 视觉塔 (q/k/v_proj 分开), vllm 视觉模块用 fused qkv, 递归 loader\n"
+            "        # 找不到 k_proj 会 raise -> 只有 EXL3 才跳过。其它量化 (NVFP4/\n"
+            "        # W4A16/AWQ/fp16) 视觉塔本就是 fused qkv, 须正常加载, 不可跳过,\n"
+            "        # 否则 ViT 保持随机 init, 多模态图片识别全废 (2026-10-08 修复:\n"
+            "        # 原无条件跳过误伤 NVFP4/W4A16 视觉塔)。\n"
+            "        _is_exl3 = (\n"
+            "            getattr(type(self), \"__name__\", \"\")\n"
+            "            == \"Qwen3_5ForConditionalGeneration\"\n"
+            "            and getattr(getattr(self, \"language_model\", None), \"quant_config\", None)\n"
+            "            is not None\n"
+            "            and getattr(\n"
+            "                self.language_model.quant_config, \"get_name\", lambda: \"\"\n"
+            "            )()\n"
+            "            == \"exl3\"\n"
+            "        )\n"
+            "        if _is_exl3:\n"
             "            weights = (\n"
             "                (n, w) for n, w in weights\n"
             "                if \"visual\" not in n.split(\".\")\n"
@@ -613,7 +691,7 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
             "\n"
             "    @classmethod\n"
             "    def get_mamba_state_dtype_from_config(\n",
-            "SM75 EXL3: skip visual tower weights (fused qkv name mismatch)",
+            "SM75 EXL3: 仅 EXL3 checkpoint 跳过视觉塔权重",
         )],
     ),
     (

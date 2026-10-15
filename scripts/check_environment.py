@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""检查安装版本与依赖偏离；只允许已记录的 FlashInfer 覆盖，不掩盖其他冲突。"""
+"""检查安装版本与依赖偏离；0.31 基线没有已记录的 override，任何冲突都算失败。"""
 import importlib.metadata as metadata
 import sys
 from packaging.requirements import Requirement
-from packaging.utils import canonicalize_name
 
 
 def check():
     failures = []
-    allowed = []
     for dist in metadata.distributions():
-        name = canonicalize_name(dist.metadata["Name"])
+        name = canonical_name(dist.metadata["Name"])
         for text in dist.requires or []:
             req = Requirement(text)
             if req.marker and not req.marker.evaluate({"extra": ""}):
@@ -23,20 +21,23 @@ def check():
                 continue
             if req.specifier.contains(version, prereleases=True):
                 continue
-            message = f"{name}: requires {req.name}{req.specifier}, installed {version}"
-            if (name == "vllm" and dist.version == "0.30.0"
-                    and canonicalize_name(req.name) == "flashinfer-python"
-                    and str(req.specifier) == "==0.6.18.post1" and version == "0.7.0"):
-                allowed.append(message)
-            else:
-                failures.append(message)
-    for item in allowed:
-        print("DOCUMENTED OVERRIDE:", item)
+            failures.append(f"{name}: requires {req.name}{req.specifier}, installed {version}")
+    for name, expected in {"vllm": "0.31.0", "torch": "2.13.0",
+                           "transformers": "5.15.1", "flashinfer-python": "0.7.0.post1",
+                           "flashinfer-cubin": "0.7.0.post1"}.items():
+        got = metadata.version(name).split("+")[0]
+        if got != expected:
+            failures.append(f"{name}: expected {expected}, found {got}")
+    for name in ("vllm", "torch", "transformers", "tokenizers",
+                 "flashinfer-python", "flashinfer-cubin", "nccl-extensions"):
+        print(name, metadata.version(name))
     for item in failures:
         print("ERROR:", item)
-    for name in ("vllm", "torch", "transformers", "flashinfer-python", "flashinfer-cubin"):
-        print(name, metadata.version(name))
     return 1 if failures else 0
+
+
+def canonical_name(value):
+    return value.lower().replace("_", "-")
 
 
 if __name__ == "__main__":

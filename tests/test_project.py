@@ -92,7 +92,31 @@ class ConfigurationTests(unittest.TestCase):
         spec = json.loads(cmd[cmd.index("--speculative-config") + 1])
         self.assertEqual(spec, {"method": "mtp", "num_speculative_tokens": 3})
         graph = json.loads(cmd[cmd.index("--compilation-config") + 1])
-        self.assertEqual(graph["cudagraph_capture_sizes"], [4])
+        # 目标机实机参数：(MTP+1) × B1..B4 连续捕获。
+        self.assertEqual(graph["cudagraph_capture_sizes"], [4, 8, 12, 16])
+
+    def test_mtp_scheduler_is_fair031(self):
+        cmd = common.build_command(config())
+        self.assertEqual(cmd[cmd.index("--scheduler-cls") + 1],
+                         "scheduler_sm75_fair031.SM75FairScheduler031")
+
+    def test_served_model_names(self):
+        cfg = config()
+        self.assertEqual(common.build_command(cfg).count("--served-model-name"), 1)
+        cfg["SERVED_MODEL_NAMES"] = "Qwen3.8-27B Nvidia-Qwen3.8-27B"
+        cmd = common.build_command(cfg)
+        self.assertEqual(cmd[cmd.index("--served-model-name") + 1], "Qwen3.8-27B")
+        self.assertEqual(cmd[cmd.index("--served-model-name", 5) + 1], "Nvidia-Qwen3.8-27B")
+
+    def test_quantization_flag(self):
+        cmd = common.build_command(config())
+        self.assertEqual(cmd[cmd.index("--quantization") + 1], "modelopt_mixed")
+        cfg = config(); cfg["QUANTIZATION"] = ""
+        self.assertNotIn("--quantization", common.build_command(cfg))
+
+    def test_quantization_looks_like_flag_rejected(self):
+        cfg = config(); cfg["QUANTIZATION"] = "--x"
+        with self.assertRaises(ValueError): common.validate(cfg)
 
     def test_mtp_off(self):
         cfg = config(); cfg["MTP_TOKENS"] = "0"
@@ -110,7 +134,9 @@ class ConfigurationTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PYTHONHOME": "/bad", "PYTHONPATH": "/bad"}):
             env = common.runtime_env(config())
         self.assertNotIn("PYTHONHOME", env)
-        self.assertNotIn("PYTHONPATH", env)
+        # 只有项目内 compat 目录可覆盖上游模块。
+        self.assertEqual(env["PYTHONPATH"], str(ROOT / "compat"))
+        self.assertEqual(env["SM75_FA2_SMALLQ_GRAPH"], "1")
 
     def test_health_wildcard(self):
         cfg = config(); cfg["HOST"] = "0.0.0.0"

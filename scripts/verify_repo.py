@@ -82,6 +82,10 @@ def main():
     actual_paths = {p.relative_to(vendor).as_posix() for p in vendor.rglob("*") if p.is_file() and "__pycache__" not in p.parts}
     if expected_paths != actual_paths:
         failures.append("Vendored file inventory differs from UPSTREAM.json")
+    for relative, entry in metadata.get("project_local", {}).items():
+        path = ROOT / relative
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]:
+            failures.append(f"{relative}: project local checksum mismatch")
     for item in failures:
         print("FAIL:", item)
     print(f"Checked {len(paths)} public source files; {len(failures)} problem(s).")

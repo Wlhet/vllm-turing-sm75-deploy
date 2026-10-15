@@ -68,12 +68,20 @@ def build_fast(builder, m, accepted):
                  builder.num_accepted_tokens, q, builder.kv_cache_spec.block_size,
                  builder.vllm_config.cache_config.mamba_cache_mode == 'align',
                  num_warps=1)
+    # spec_sequence_masks_cpu 必须与 num_spec_decodes=1 一致地给 [True]: 原生 build()
+    # 总是把 mask 与 num_spec_decodes 一起设置, 而本快路径若漏掉它(默认 None), 会被
+    # update_block_table 按 spec_sequence_masks_cpu 分派——None 走非 spec 分支令
+    # spec_indices=None, 但 _stage_spec_decode 门仍按 num_spec_decodes=1 触发, 从而
+    # copy_(None) 崩。仅当 hybrid 模型有 >=2 个 GDN 组共享 reuse_key(第 2 组走
+    # update_block_table 复用)时才暴露, 单 GDN 组不会触发。
+    spec_sequence_masks_cpu = torch.tensor([True], dtype=torch.bool)
     return GDNAttentionMetadata(
         num_prefills=0, num_prefill_tokens=0, num_decodes=0, num_decode_tokens=0,
         num_spec_decodes=1, num_spec_decode_tokens=q, num_actual_tokens=q,
         spec_query_start_loc=builder.spec_query_start_loc[:2],
         spec_state_indices_tensor=builder.spec_state_indices_tensor[:1],
         spec_sequence_masks=builder.spec_sequence_masks[:1],
+        spec_sequence_masks_cpu=spec_sequence_masks_cpu,
         spec_token_indx=builder.spec_token_indx[:q],
         non_spec_token_indx=builder.non_spec_token_indx[:0],
         num_accepted_tokens=builder.num_accepted_tokens[:1])

@@ -19,20 +19,30 @@ def apply_injections(package_root: Path) -> None:
     与整文件 copy 的 files 列表互斥: 一个文件要么整文件覆盖、要么锚点注入,
     不两者都做。probe 已存在(注入过)则跳过; 否则要求 anchor 恰好唯一且存在,
     否则抛错(防止注入打错位置/漏注入)。
+
+    anchor 可为 str 或候选列表 [str, ...]: 按序取第一个在文件中恰好出现一次
+    的候选做替换。用于"改已注入过的条目"——容器内文件已是旧注入版(上游原始
+    anchor 已被替换), 新 anchor 须同时列上游原始版与旧注入版两候选, 才能既
+    覆盖新装镜像、又把运行中容器里的旧注入版升级掉。
     """
     for relative, pairs in INJECTIONS:
         target = package_root / relative
         if not target.is_file():
             raise FileNotFoundError(target)
         text = target.read_text(encoding="utf-8")
-        for anchor, replacement, probe in pairs:
+        for entry, replacement, probe in pairs:
             if probe in text:
                 continue  # 已注入, 幂等跳过
-            if text.count(anchor) != 1:
+            candidates = entry if isinstance(entry, (list, tuple)) else (entry,)
+            for candidate in candidates:
+                if text.count(candidate) == 1:
+                    break
+            else:
                 raise RuntimeError(
-                    f"anchor not unique in {relative} (count={text.count(anchor)}): {anchor!r}"
+                    f"anchor not found exactly once in {relative}: "
+                    f"{candidates[0][:60]!r}... ({len(candidates)} candidate(s))"
                 )
-            text = text.replace(anchor, replacement)
+            text = text.replace(candidate, replacement)
         target.write_text(text, encoding="utf-8")
 
 
@@ -63,6 +73,12 @@ def main() -> None:
         # 见 vllm/model_executor/layers/quantization/utils/firefly_nvfp4.py。
         "model_executor/layers/quantization/utils/firefly_nvfp4.py",
         "model_executor/layers/quantization/utils/firefly_nvfp4.cu",
+        # NVFP4 decode m16n8k8 tensor-core GEMM (自研 Skillet, 参考公开 skinny-GEMV
+        # 思路): prepack 预解 E4M3 scale + 独享快照 (跳 marlin repack) + prefill
+        # unpack 反解。VLLM_FIREFLY_SKILLET 门控, off=上游 NVFP4 Marlin。
+        # 见 vllm/model_executor/layers/quantization/utils/firefly_skillet.py。
+        "model_executor/layers/quantization/utils/firefly_skillet.py",
+        "model_executor/layers/quantization/utils/firefly_skillet.cu",
         "model_executor/kernels/linear/nvfp4/marlin.py",
         "model_executor/layers/quantization/exl3/__init__.py",
         "model_executor/layers/quantization/exl3/exl3.py",
@@ -87,6 +103,16 @@ def main() -> None:
         "models/qwen4_exp/nvidia/ops/qsa_indexer.py",
         "models/qwen4_exp/common/qsa_cache.py",
         "model_executor/warmup/qwen4_exp_qsa_warmup.py",
+        # QSA SM75 fast prefill 移植 (step2/3/4, 单请求): cuBLAS indexer 打分
+        # (step2, VLLM_QSA_FAST_INDEXER) + 短 ctx FA2 (step3,
+        # VLLM_QSA_FAST_SHORT_PREFILL) + 长 ctx FA2 paged (step4,
+        # VLLM_QSA_FAST_LONG_PREFILL)。整文件覆盖 (新文件); 接线在
+        # overlay_injections.py (indexer_qsa.py cuBLAS / kernel_warmup.py 预热)。
+        "models/qwen4_exp/nvidia/ops/qsa_fast_indexer.py",
+        "models/qwen4_exp/nvidia/ops/qsa_fast_short_prefill.py",
+        "models/qwen4_exp/nvidia/ops/qsa_fast_fp8_storage.py",
+        "models/qwen4_exp/nvidia/ops/qsa_fast_long_prefill.py",
+        "models/qwen4_exp/nvidia/ops/qsa_fast_long_prefill_fp8.py",
         "vllm_ple_mmap.py",
         "vllm_mtp_stage_local.py",
         "vllm_hc_dequant.py",
@@ -135,24 +161,26 @@ def main() -> None:
     if "quantization.exl3 import Exl3Config" not in quant_text:
         quant_init.write_text(quant_text + exl3_hook)
 
-    # PLE(ngram) 两处改动, 都在 ngram_embedding.py: (1) fp8 表 pinned-lookup 改
-    # raw-byte 直拷 (inline 锚点替换); (2) 大表 NVMe mmap offload (末尾 append hook,
-    # 在类定义后触发 maybe_apply 打 patch)。v0.30 起 Qwen4ExpNGramEmbedding 类从
-    # ple_layer.py 搬到 ngram_embedding.py (ple_layer.py 仅 import)。读一次文件,
-    # 两个改动各自 marker 判幂等, 写一次。手法与上面 envs hook 一致。文件不存在
-    # (底座没带 qwen4_exp 模型) 则跳过 —— PLE 只在该模型下有意义, 不影响其余行为。
-    ngram_emb_file = package_root / "models/qwen4_exp/nvidia/ngram_embedding.py"
-    if ngram_emb_file.is_file():
-        ngram_emb_text = ngram_emb_file.read_text()
-        # PLE fp8 表 pinned-lookup raw-byte 直拷: fp8 权重走 pinned host 拷贝路径时,
-        # 原 PyTorch copy 会做 fp8->fp32->fp8 的 dtype 转换; 这里对 fp8 (e4m3/e5m2)
-        # 的 weight 与 output 改 .view(torch.uint8), 按 raw byte 直拷, bit-exact 且省
-        # 一次无意义往返。kernel 是纯 gather (无对 values 的算术) + fp8 恰好 1 字节/
-        # 元素, 故 view 后 embedding_dim 索引语义不变。非 fp8 (int8/int4/mem) 走原路。
-        # 幂等: 含 view(torch.uint8) 即已注入。断言防上游改锚点静默漏注入 (qwen4_exp
-        # 确定要跑, 锚点必须命中)。
-        if "view(torch.uint8)" not in ngram_emb_text:
-            ngram_emb_text = ngram_emb_text.replace(
+    # PLE(ngram) 两处改动分属两个文件 (v0.31.0 起 Qwen4ExpNGramEmbedding 的
+    # pinned-lookup 实现从 nvidia/ngram_embedding.py 搬到 common/ngram_embedding.py,
+    # nvidia 只留类定义 + 委托, 见 v0.30→0.31 该文件 -510/+24):
+    #   (1) fp8 表 pinned-lookup 改 raw-byte 直拷 —— kernel launch 锚点在 common;
+    #   (2) 大表 NVMe mmap offload —— 末尾 append hook 触发 maybe_apply, 须打在
+    #       类定义所在的 nvidia 文件 (maybe_apply 替换 nvidia 模块的
+    #       Qwen4ExpPLEDeviceEmbedding 全局名, 见 vllm_ple_mmap.py)。
+    # 手法与上面 envs hook 一致: 文件不存在 (底座没带 qwen4_exp) 则跳过。
+    # ---- (1) fp8 raw-byte 直拷 (common/ngram_embedding.py) ----
+    # fp8 权重走 pinned host 拷贝路径时, 原 PyTorch copy 会做 fp8->fp32->fp8 的
+    # dtype 转换; 对 fp8 (e4m3/e5m2) 的 weight 与 output 改 .view(torch.uint8),
+    # 按 raw byte 直拷, bit-exact 且省一次无意义往返。kernel 是纯 gather (无对
+    # values 的算术) + fp8 恰好 1 字节/元素, 故 view 后 embedding_dim 索引语义
+    # 不变。非 fp8 (int8/int4/mem) 走原路。幂等: 含 view(torch.uint8) 即已注入。
+    # 断言防上游改锚点静默漏注入 (qwen4_exp 确定要跑, 锚点必须命中)。
+    ngram_common_file = package_root / "models/qwen4_exp/common/ngram_embedding.py"
+    if ngram_common_file.is_file():
+        common_text = ngram_common_file.read_text()
+        if "view(torch.uint8)" not in common_text:
+            common_text = common_text.replace(
                 "                self._uva_weight,\n"
                 "                flat_ids,\n"
                 "                output,\n",
@@ -165,9 +193,13 @@ def main() -> None:
                 "else output,\n",
                 1,
             )
-            assert "self._uva_weight.view(torch.uint8)" in ngram_emb_text, (
-                "PLE fp8 锚点未匹配 (上游 ngram_embedding.py 变更?)")
-        # PLE 大表 NVMe mmap offload (idempotent)。
+            assert "self._uva_weight.view(torch.uint8)" in common_text, (
+                "PLE fp8 锚点未匹配 (上游 common/ngram_embedding.py 变更?)")
+            ngram_common_file.write_text(common_text)
+    # ---- (2) 大表 NVMe mmap offload (nvidia/ngram_embedding.py, 类定义处) ----
+    ngram_emb_file = package_root / "models/qwen4_exp/nvidia/ngram_embedding.py"
+    if ngram_emb_file.is_file():
+        ngram_emb_text = ngram_emb_file.read_text()
         ple_hook = (
             "\n# vllm-turing overlay: PLE 表 NVMe mmap offload (idempotent).\n"
             "import vllm.vllm_ple_mmap\n"
@@ -175,7 +207,7 @@ def main() -> None:
         )
         if "vllm.vllm_ple_mmap.maybe_apply" not in ngram_emb_text:
             ngram_emb_text = ngram_emb_text + ple_hook
-        ngram_emb_file.write_text(ngram_emb_text)
+            ngram_emb_file.write_text(ngram_emb_text)
 
     # MTP 草稿头 stage-local: 往上游 qwen4_exp mtp.py 末尾 append 一行, 在
     # Qwen4ExpMultiTokenPredictor 类定义之后、实例化之前触发 maybe_apply (打 patch)。

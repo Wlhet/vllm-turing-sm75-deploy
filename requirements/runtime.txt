@@ -1,8 +1,9 @@
-# 与已验证部署一致的主要依赖；通过 uv --override 处理 FlashInfer 偏离。
-vllm==0.30.0
+# 与已验证部署（2026-10-09 目标机 venv）一致的主要依赖。
+# FlashInfer 版本由 overrides.txt 保持与上游 0.31 要求一致。
+vllm==0.31.0
 torch==2.13.0
-flashinfer-python==0.7.0
-flashinfer-cubin==0.7.0
+flashinfer-python==0.7.0.post1
+flashinfer-cubin @ https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.0.post1/flashinfer_cubin-0.7.0.post1-py3-none-any.whl#sha256=f5b5fbf6e914b358219b845ed3ee586ffc1ae3c9768c8b135115ac14afbceed3
 nccl-extensions==0.1.0
 transformers==5.15.1
 tokenizers==0.22.2

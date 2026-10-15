@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
@@ -16,25 +18,42 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 
 @triton.jit
 def _qsa_fp8e4m3fn_bits_to_fp32(bits):
-    """sm75 无硬件 fp8: 把原始 E4M3FN 字节 (uint8) 纯位运算/浮点算术解码成 fp32。
+    """sm75 无硬件 fp8: 把原始 E4M3FN 字节 (uint8) 位组装解码成 fp32。
 
     关键: 输入是 uint8 字节而非 float8_e4m3fn 张量。sm75 的 Triton codegen
     只支持 fp8e4b15 / fp8e5, 对 float8_e4m3fn (fp8e4nv) 连 .to(tl.float32)
     的 cast 都在编译期报 "type fp8e4nv not supported in this architecture"。
-    故 K/V cache 按 uint8 物理字节进 kernel, 用 sign/exponent/mantissa 位拆 +
-    tl.exp2 解码 (subnormal: e=0 → m*2^-9; normal: (1+m/8)*2^(e-7); NaN:
-    e=15,m=7), 全程不出现 fp8 dtype。与 IEEE 直接 cast 数值等价 (E4M3FN 无 inf,
-    448.0 饱和即 e=15,m=6)。"""
-    value_bits = bits.to(tl.int32)
-    sign = tl.where((value_bits & 0x80) != 0, -1.0, 1.0)
-    exponent = (value_bits >> 3) & 0x0F
-    mantissa = value_bits & 0x07
-    subnormal = mantissa.to(tl.float32) * (2.0 ** -9)
-    normal = (1.0 + mantissa.to(tl.float32) * 0.125) * tl.exp2(
-        exponent.to(tl.float32) - 7.0
+    故 K/V cache 按 uint8 物理字节进 kernel, 位组装解码, 全程不出现 fp8 dtype:
+      - normal (e>=1): E4M3 无偏指数 e-7 → fp32 指数 (e-7)+127 = e+120,
+        尾数左移 20 位, 拼 sign 后一次 bitcast 出 fp32 (纯 ALU);
+      - subnormal (e=0): m*2^-9 (m<=7 不溢出 fp32 尾数, 可精确表示) 数值
+        算出后取其 fp32 位型 OR sign 再 bitcast;
+      - NaN: e=15, m=7; E4M3FN 无 inf, 448.0 饱和即 e=15, m=6。
+    与 IEEE 直接 cast 逐位一致 (全 256 模式 bit-exact 已真机验证)。"""
+    raw = bits.to(tl.uint32)
+    sign = (raw & 0x80) << 24
+    exponent = (raw >> 3) & 0x0F
+    mantissa = raw & 0x07
+    normal_bits = sign | ((exponent + 120) << 23) | (mantissa << 20)
+    normal = normal_bits.to(tl.float32, bitcast=True)
+    subnormal = (mantissa.to(tl.float32) * (2.0 ** -9)).to(
+        tl.uint32, bitcast=True
     )
-    decoded = tl.where(exponent == 0, subnormal, normal) * sign
+    subnormal = (subnormal | sign).to(tl.float32, bitcast=True)
+    decoded = tl.where(exponent == 0, subnormal, normal)
     return tl.where((exponent == 15) & (mantissa == 7), float("nan"), decoded)
+
+
+@lru_cache(maxsize=1)
+def _is_sm120() -> bool:
+    """True on sm_120 (RTX PRO 6000 Blackwell): selects the sm_120 tuning table."""
+    return current_platform.get_device_capability() == (12, 0)
+
+
+@lru_cache(maxsize=1)
+def _is_sm90() -> bool:
+    """True on sm_90 (H100/H200/H20): selects the sm_90 tuning table."""
+    return current_platform.get_device_capability() == (9, 0)
 
 
 @triton.jit(do_not_specialize=["num_rows", "num_requests"])
@@ -48,6 +67,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    softmax_scale,
+    output_scale,
     output_gate_ptr,
     stride_q_row,
     stride_q_head,
@@ -76,7 +97,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    KV_E4M3: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -106,7 +127,10 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
-    softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
+    # softmax_scale is the host-side attention scale (1/sqrt(head_dim), with the
+    # fp8 K dequant scale already pre-multiplied in); convert to log2 units once
+    # here for the exp2-based online softmax.
+    score_scale = softmax_scale * 1.4426950408889634
 
     tile_end = tl.minimum(NUM_TILES, tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N))
 
@@ -154,29 +178,31 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
-        # 主 KV cache 可为 FP8 E4M3 (sm75 无硬件 fp8): forward_qsa 不再
-        # .view(float8_e4m3fn) (那会让 kernel 看到 fp8e4nv 张量, 连 .to(fp32)
-        # 的 cast 都在 sm75 编译期报 "type fp8e4nv not supported"), 而是直接把
-        # uint8 物理字节进 kernel (KV_E4M3=True)。kernel 内用 _qsa_fp8e4m3fn_bits_
-        # to_fp32 纯位运算 + tl.exp2 解码成 fp32 再降 query 激活 dtype (sm75 fp16 /
-        # 高 CC bf16) 参与 tl.dot, 全程不出现 fp8 dtype。E4M3 用 unit scale (未校准
-        # k/v_scale, 见 ../qsa.py)。非 fp8 (bf16/f16) cache 时 KV_E4M3=False,
-        # 直接 .to(query.dtype) (同 dtype 时 no-op), 行为与上游一致。
-        if KV_E4M3:
+        # sm75 无硬件 fp8 反量化: K/V cache 以 uint8 物理字节进 kernel (IS_FP8),
+        # 用 _qsa_fp8e4m3fn_bits_to_fp32 纯位运算解码成 fp32 再降 query 激活 dtype
+        # (硬件 .to(query.dtype) 在 sm75 对 fp8e4nv 编译报 "not supported")。
+        # 非 fp8 (bf16/f16) cache 时 IS_FP8=False, 直接 .to(query.dtype) (同 dtype
+        # 时 no-op), 行为与上游一致。
+        if IS_FP8:
             keys = _qsa_fp8e4m3fn_bits_to_fp32(keys).to(query.dtype)
-            values = _qsa_fp8e4m3fn_bits_to_fp32(values).to(query.dtype)
         else:
             keys = keys.to(query.dtype)
-            values = values.to(query.dtype)
         scores = tl.dot(query, keys)
-        # Scaling scores avoids re-quantizing a scaled query to BF16.
-        scores *= softmax_scale_log2
+        # Scaling scores avoids re-quantizing a scaled query to BF16; for fp8
+        # caches the K dequant scale is already folded into softmax_scale on the
+        # host.
+        scores *= score_scale
         scores = tl.where(valid[None, :], scores, -1.0e20)
         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
         alpha = tl.math.exp2(max_value - next_max)
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
+        if IS_FP8:
+            # sm75: V 用位运算解码成 fp32 再升 fp16 做 PV dot (硬件 .to 对
+            # fp8e4nv 在 sm75 编译报错)。沿用上游设计: fp16 的 range/mantissa
+            # 适合 P<=1 (online softmax) 的 PV dot。
+            values = _qsa_fp8e4m3fn_bits_to_fp32(values).to(tl.float16)
         accumulator = tl.dot(
             probabilities.to(values.dtype),
             values,
@@ -186,9 +212,14 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         max_value = next_max
 
     has_values = normalizer > 0
+    # Fold the fp8 V dequant scale (output_scale, 1.0 for bf16) into a per-row
+    # reciprocal normalizer, so the output is a per-row multiply rather than a
+    # HEAD_DIM-wide scale. The split-K LSE below keeps the unscaled normalizer,
+    # so the merge stays correct.
+    inv_normalizer = output_scale / tl.maximum(normalizer, 1.0e-20)
     normalized_output = tl.where(
         has_values[:, None],
-        accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
+        accumulator * inv_normalizer[:, None],
         0.0,
     )
     output_mask = head_offsets[:, None] < GROUP_SIZE
@@ -478,18 +509,98 @@ def _compress_qsa_groups_kernel(
     )
 
 
+def _select_sm120_config(
+    base_programs: int, use_prefill_config: bool, is_fp8: bool
+) -> tuple[int, int, int]:
+    """(block_n, target_splits, num_warps) retuned on sm_120 (RTX PRO 6000
+    Blackwell), split by cache dtype: bf16 and fp8 favour different configs on
+    sm_120, most visibly on the large-prefill region. Each entry is the fastest
+    config that stays correct on its own path; the main win is more warps.
+    """
+    if is_fp8:
+        if base_programs > 2048:
+            return (32, 2, 1) if use_prefill_config else (64, 1, 2)
+        if base_programs <= 24:
+            return 64, 64, 8
+        if base_programs <= 32:
+            return 128, 8, 4
+        if base_programs <= 64:
+            return 64, 8, 4
+        if base_programs <= 128:
+            return 32, 4, 4
+        if base_programs <= 256:
+            return 128, 4, 4
+        if base_programs <= 512:
+            return 64, 4, 4
+        return 32, 2, 1
+    # bf16 K/V cache.
+    if base_programs > 2048:
+        return 64, 2, 2
+    if base_programs <= 24:
+        return 64, 64, 8
+    if base_programs <= 64:
+        return 64, 8, 8
+    if base_programs <= 128:
+        return 32, 8, 8
+    if base_programs <= 256:
+        return 32, 8, 1
+    if base_programs <= 512:
+        return 64, 4, 2
+    return 32, 4, 1
+
+
+def _select_sm90_config(
+    base_programs: int, use_prefill_config: bool, is_fp8: bool
+) -> tuple[int, int, int]:
+    """(block_n, target_splits, num_warps) tuned on sm_90 (H20)."""
+    if base_programs > 2048:
+        return (32, 1, 1) if use_prefill_config else (64, 1, 2)
+    if is_fp8:
+        if base_programs <= 24:
+            return 64, 64, 2
+        if base_programs <= 32:
+            return 32, 16, 1
+        if base_programs <= 64:
+            return 32, 8, 1
+        if base_programs <= 128:
+            return 32, 4, 1
+        if base_programs <= 256:
+            return 32, 8, 1
+        return 32, 4, 1
+    if base_programs <= 32:
+        return 64, 64, 2
+    if base_programs <= 64:
+        return 32, 16, 1
+    if base_programs <= 256:
+        return 32, 8, 1
+    return 32, 4, 1
+
+
 def _select_config(
-    num_rows: int, num_kv_heads: int, use_prefill_config: bool, num_columns: int
+    num_rows: int,
+    num_kv_heads: int,
+    use_prefill_config: bool,
+    num_columns: int,
+    is_fp8: bool = False,
 ) -> tuple[int, int, int, int]:
     """Select (block_n, num_warps, num_tiles, num_splits) for the kernel.
 
-    Tuned on GB300 for the Qwen3.8-Flash-Next TP1/TP2/TP4 shapes, keyed on
-    base_programs = num_rows * num_kv_heads. The bp > 2048 region splits on
-    use_prefill_config (capture-stable: at FULL-graph capture max_query_len is the
-    uniform decode/verify length).
+    Keyed on base_programs = num_rows * num_kv_heads. The bp > 2048 region splits
+    on use_prefill_config (capture-stable: at FULL-graph capture max_query_len is
+    the uniform decode/verify length). This default table was tuned on GB300;
+    sm_120 (RTX PRO 6000 Blackwell) dispatches to _select_sm120_config instead,
+    and sm_90 (Hopper) to _select_sm90_config.
     """
     base_programs = num_rows * num_kv_heads
-    if base_programs > 2048:
+    if _is_sm120():
+        BLOCK_N, target_splits, num_warps = _select_sm120_config(
+            base_programs, use_prefill_config, is_fp8
+        )
+    elif _is_sm90():
+        BLOCK_N, target_splits, num_warps = _select_sm90_config(
+            base_programs, use_prefill_config, is_fp8
+        )
+    elif base_programs > 2048:
         BLOCK_N, target_splits, num_warps = (
             (32, 1, 1) if use_prefill_config else (64, 1, 2)
         )
@@ -534,10 +645,17 @@ def qsa_sparse_paged_attention(
     token_to_req: torch.Tensor,
     use_prefill_config: bool,
     out: torch.Tensor | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
     *,
     output_gate: torch.Tensor,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches.
+    """Run sparse GQA directly over paged BF16 or FP8-e4m3 K/V caches.
+
+    With fp8 caches, k_scale/v_scale are the layer's per-tensor dequant scales
+    as host floats (e.g. layer._k_scale_float/_v_scale_float): k_scale is
+    pre-multiplied into the softmax scale and v_scale becomes the kernel's
+    output scale, so the kernel needs no device scale buffers.
 
     logical_indices is the PACKED selection buffer: [rows, selection_width + 1]
     with the trailing column holding each row's valid-entry count (written by
@@ -561,16 +679,24 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    # 主 K/V 可为 FP8 E4M3 (uint8 物理字节, kernel 内 _qsa_fp8e4m3fn_bits_to_fp32
-    # 位运算解码) 或激活 dtype (原路径); query 恒为激活 dtype (sm75 回退 f16, 其余
-    # bf16)。kernel 对 dtype 无关 (tl.dot f16/bf16 均走 f32 累加)。fp8 cache 以
-    # uint8 进 kernel (kv_e4m3=True): 若 .view(float8_e4m3fn) 会让 sm75 Triton
-    # 看到 fp8e4nv 张量, 连 .to(fp32) 都编译期报错, 故必须按字节解码。此处 dtype 门
-    # 与模型层 forward_qsa 逐元素一致 (契约 C2), 且不含 float8_e4m3fn。
+    # sm75: 主 K/V 可为 FP8 E4M3 (uint8 物理字节, kernel 内位运算解码) 或激活
+    # dtype; query 恒为激活 dtype (sm75 回退 f16, 其余 bf16)。fp8 cache 以
+    # uint8 进 kernel (不 view float8_e4m3fn, 避免 sm75 Triton 对 fp8e4nv 的
+    # cast 编译报错), 故 is_fp8 按 uint8 检测。dtype 门与模型层 forward_qsa
+    # 逐元素一致 (契约 C2)。sm75 无硬件 per-tensor scale, caller 未传
+    # k_scale/v_scale 时用 unit scale (未校准)。
     assert q.dtype in (torch.bfloat16, torch.float16)
     assert k_cache.dtype in (torch.bfloat16, torch.float16, torch.uint8)
     assert k_cache.dtype == v_cache.dtype
-    kv_e4m3 = k_cache.dtype == torch.uint8
+    is_fp8 = k_cache.dtype == torch.uint8
+    if is_fp8:
+        # Host pre-multiply: fold the K dequant scale into the attention scale
+        # and pass V's dequant scale as the kernel's output scale.
+        softmax_scale = (head_dim**-0.5) * float(k_scale if k_scale is not None else 1.0)
+        output_scale = float(v_scale if v_scale is not None else 1.0)
+    else:
+        softmax_scale = head_dim**-0.5
+        output_scale = 1.0
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -595,7 +721,7 @@ def qsa_sparse_paged_attention(
     block_m = triton.next_power_of_2(group_size)
     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
     block_n, partial_warps, num_tiles, num_splits = _select_config(
-        q.shape[0], k_cache.shape[2], use_prefill_config, selection_width
+        q.shape[0], k_cache.shape[2], use_prefill_config, selection_width, is_fp8
     )
 
     # Split=1 writes output directly and compiles out all workspace accesses.
@@ -625,6 +751,8 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        softmax_scale,
+        output_scale,
         output_gate_view,
         q.stride(0),
         q.stride(1),
@@ -653,7 +781,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
-        KV_E4M3=kv_e4m3,
+        IS_FP8=is_fp8,
         num_warps=partial_warps,
         num_stages=2,
     )
@@ -688,16 +816,22 @@ def warmup_qsa_sparse_paged_attention(
     selection_width: int,
 ) -> tuple[tuple[int, int, int], ...]:
     """Compile every production-reachable split-K/merge specialization."""
-
     head_dim = kv_cache.shape[-1] // 2
     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+    # sm75: fp8 主 KV 以 uint8 物理字节进 kernel (kernel 内位运算解码, 不
+    # view float8_e4m3fn —— sm75 Triton 对 fp8e4nv 的 cast 编译报错), 故
+    # warmup 也用 uint8 编译出与运行时一致的 specialization。
+    is_fp8 = kv_cache.dtype == torch.uint8
+    cache_dtype = torch.uint8 if is_fp8 else key_cache.dtype
     num_kv_heads = key_cache.shape[2]
     group_size = num_query_heads // num_kv_heads
     block_m = triton.next_power_of_2(group_size)
 
     # Every config the dispatch can pick for this group size.
     profiles = {
-        _select_config(num_rows, num_kv_heads, use_prefill_config, selection_width)
+        _select_config(
+            num_rows, num_kv_heads, use_prefill_config, selection_width, is_fp8
+        )
         for num_rows in range(1, 8193)
         for use_prefill_config in (False, True)
     }
@@ -711,12 +845,12 @@ def warmup_qsa_sparse_paged_attention(
         torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
     )
     k_cache_ptr = TritonWarmupTensor(
-        key_cache.dtype,
+        cache_dtype,
         shape=tuple(key_cache.shape),
         strides=tuple(key_cache.stride()),
     )
     v_cache_ptr = TritonWarmupTensor(
-        value_cache.dtype,
+        cache_dtype,
         shape=tuple(value_cache.shape),
         strides=tuple(value_cache.stride()),
     )
@@ -752,11 +886,11 @@ def warmup_qsa_sparse_paged_attention(
             partial_lse_ptr = TritonWarmupTensor(
                 torch.float32, shape=(num_splits, num_rows, num_query_heads)
             )
-        # 主 KV 的 fp8 软件解码档 (KV_E4M3=True) 与 bf16 档编译出的 specialization
-        # 不同 (keys/values 走位运算解码 vs 直读), 而本 warmup 的 mock cache 恒为
-        # bf16 (KV_E4M3=False)。真机上 uint8 主 KV 首次 prefill 会 JIT 编译 fp8 档
-        # split-K kernel —— 属可接受的首次编译开销 (仅 fp8_e4m3 KV 路径), 非启动期
-        # OutOfResources 老坑 (sm75 降档已在 _select_config 生效, BLOCK_N 落 16)。
+        # 主 KV 的 fp8 软件解码档 (IS_FP8=True) 与 bf16 档编译出的 specialization
+        # 不同 (keys/values 走位运算解码 vs 直读)。本 warmup 传真实 kv_cache,
+        # is_fp8 按其 dtype 正确检测, fp8 主 KV 会在此 warm 出 fp8 档 split-K
+        # kernel (非首次 prefill 才 JIT)。sm75 降档已在 _select_config 生效
+        # (BLOCK_N 落 16), 无启动期 OutOfResources 老坑。
         _qsa_sparse_paged_gqa_splitk_kernel.warmup(
             q_ptr,
             k_cache_ptr,
@@ -767,6 +901,8 @@ def warmup_qsa_sparse_paged_attention(
             partial_output_ptr,
             partial_lse_ptr,
             output_ptr,
+            1.0,
+            1.0,
             output_gate_ptr,
             row_stride,
             head_stride,
@@ -795,7 +931,7 @@ def warmup_qsa_sparse_paged_attention(
             NUM_TILES=num_tiles,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
-            KV_E4M3=False,
+            IS_FP8=is_fp8,
             num_warps=warps,
             num_stages=2,
             grid=(num_rows, num_kv_heads, num_splits),
@@ -829,7 +965,6 @@ def qsa_store_cache_rows(
     rows: torch.Tensor,
 ) -> None:
     """Store fixed-width rows in a QSA cache without boolean indexing."""
-
     if not cache.is_cuda or not HAS_TRITON:
         raise RuntimeError("QSA CUDA cache stores require Triton")
     if cache.ndim != 4 or cache.shape[2] != 1:
@@ -875,7 +1010,6 @@ def qsa_compress_groups_with_ratio(
     rope_cache: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pool completed groups from the compressor-state ring and raw token rows."""
-
     if not raw_keys.is_cuda or not HAS_TRITON:
         raise RuntimeError("QSA CUDA compression requires Triton")
     rows = token_to_req.numel()

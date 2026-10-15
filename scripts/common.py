@@ -9,12 +9,13 @@ import shlex
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULTS = {
-    "MODEL_PATH": "", "VLLM_API_KEY": "", "SERVED_MODEL_NAME": "Qwen3.8-27B",
+    "MODEL_PATH": "", "VLLM_API_KEY": "", "SERVED_MODEL_NAMES": "Qwen3.8-27B",
     "HOST": "127.0.0.1", "PORT": "8000", "GPU_IDS": "0,1,2,3",
     "TENSOR_PARALLEL_SIZE": "4", "MAX_MODEL_LEN": "262144",
     "GPU_MEMORY_UTILIZATION": "0.92", "MAX_NUM_SEQS": "4",
     "MAX_NUM_BATCHED_TOKENS": "4096", "LONG_PREFILL_TOKEN_THRESHOLD": "2048",
-    "MTP_TOKENS": "3", "FIREFLY_DIRECT": "1", "FIREFLY_AR": "1",
+    "MTP_TOKENS": "3", "QUANTIZATION": "modelopt_mixed",
+    "FIREFLY_DIRECT": "1", "FIREFLY_AR": "1",
     "FIREFLY_AR_BACKEND": "auto", "CUDA_HOME": "/usr/local/cuda-13.1",
     "CC": "gcc-13", "CXX": "g++-13", "MAX_JOBS": "2",
 }
@@ -54,9 +55,13 @@ def validate(cfg, require_files=False):
         raise ValueError("Set VLLM_API_KEY to a real secret of at least 16 characters")
     if not cfg["MODEL_PATH"] or cfg["MODEL_PATH"].startswith("/path/to/"):
         raise ValueError("Set MODEL_PATH to the local model directory")
-    for name in ("HOST", "SERVED_MODEL_NAME"):
-        if not cfg[name] or cfg[name].startswith("-"):
-            raise ValueError(f"Invalid {name}")
+    if not cfg["HOST"] or cfg["HOST"].startswith("-"):
+        raise ValueError("Invalid HOST")
+    names = shlex.split(cfg["SERVED_MODEL_NAMES"], comments=True)
+    if not names or any(not n or n.startswith("-") for n in names):
+        raise ValueError("SERVED_MODEL_NAMES must be one or more plain names")
+    if cfg["QUANTIZATION"] and (" " in cfg["QUANTIZATION"] or cfg["QUANTIZATION"].startswith("-")):
+        raise ValueError("QUANTIZATION must be a single token or empty to let vLLM auto-detect")
     positive = ("PORT", "TENSOR_PARALLEL_SIZE", "MAX_MODEL_LEN", "MAX_NUM_SEQS",
                 "MAX_NUM_BATCHED_TOKENS", "LONG_PREFILL_TOKEN_THRESHOLD", "MAX_JOBS")
     for name in positive:
@@ -90,9 +95,15 @@ def validate(cfg, require_files=False):
 
 
 def build_command(cfg):
-    """只生成 argv，不用 shell 拼接；密钥通过环境变量传递，不放入命令行。"""
-    command = [str(ROOT / ".venv/bin/vllm"), "serve", str(resolved(cfg["MODEL_PATH"])),
-               "--served-model-name", cfg["SERVED_MODEL_NAME"],
+    """只生成 argv，不用 shell 拼接；密钥通过环境变量传递，不放入命令行。
+
+    HYBRID 结构模型（NVFP4 W4A16 等）需要显式量化器，见 .env.example。"""
+    command = [str(ROOT / ".venv/bin/vllm"), "serve", str(resolved(cfg["MODEL_PATH"]))]
+    for name in shlex.split(cfg["SERVED_MODEL_NAMES"], comments=True):
+        command += ["--served-model-name", name]
+    if cfg["QUANTIZATION"]:
+        command += ["--quantization", cfg["QUANTIZATION"]]
+    command += [
                "--host", cfg["HOST"], "--port", cfg["PORT"],
                "--tensor-parallel-size", cfg["TENSOR_PARALLEL_SIZE"],
                "--disable-custom-all-reduce", "--max-model-len", cfg["MAX_MODEL_LEN"],
@@ -107,17 +118,20 @@ def build_command(cfg):
                "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder",
                "--generation-config", "vllm"]
     mtp = int(cfg["MTP_TOKENS"])
-    graph = {"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [mtp + 1]}
+    # 小 query Graph 适配器（compat/sm75_fa2_graph.py）支持 B1–B4 连续捕获；
+    # 捕获逐步 = (MTP+1) × 请求数，与目标机实机参数一致。
+    sizes = [1] if mtp == 0 else [(mtp + 1) * batch for batch in range(1, 5)]
+    graph = {"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": sizes}
     command += ["--compilation-config", json.dumps(graph, separators=(",", ":"))]
     if mtp:
         command += ["--speculative-config", json.dumps({"method": "mtp", "num_speculative_tokens": mtp}),
-                    "--scheduler-cls", "vllm.v1.core.sched.scheduler_sm75.SM75Scheduler"]
+                    "--scheduler-cls", "scheduler_sm75_fair031.SM75FairScheduler031"]
     return command
 
 
 def runtime_env(cfg):
     env = dict(os.environ)
-    for key in ("PYTHONPATH", "PYTHONHOME"):
+    for key in ("PYTHONHOME",):
         env.pop(key, None)
     cache = ROOT / ".runtime/cache"
     cuda = resolved(cfg["CUDA_HOME"])
@@ -125,6 +139,8 @@ def runtime_env(cfg):
         "PATH": f"{ROOT / '.venv/bin'}:{cuda / 'bin'}:{env.get('PATH', '')}",
         "LD_LIBRARY_PATH": f"{cuda / 'lib64'}:{env.get('LD_LIBRARY_PATH', '')}",
         "CUDA_HOME": str(cuda), "CC": cfg["CC"], "CXX": cfg["CXX"],
+        # 项目内本地适配目录（scheduler_sm75_fair*, sm75_fa2_graph），覆盖上游同名模块。
+        "PYTHONPATH": str(ROOT / "compat"), "SM75_FA2_SMALLQ_GRAPH": "1",
         "CUDA_VISIBLE_DEVICES": cfg["GPU_IDS"], "TORCH_CUDA_ARCH_LIST": "7.5",
         "VLLM_API_KEY": cfg["VLLM_API_KEY"], "PYTHONUNBUFFERED": "1",
         "VLLM_CACHE_ROOT": str(cache / "vllm"), "FLASHINFER_CACHE_DIR": str(cache / "flashinfer"),

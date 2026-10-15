@@ -2,7 +2,7 @@
 
 ## 1. 前提与边界
 
-验证基线为 Linux x86_64、4×Tesla T10 16GB（SM75）、Python 3.12、驱动 595.91.07、CUDA toolkit 13.1、GCC/G++ 13。这些是历史验证版本，不是推导出的最低版本。其他驱动组合需另行验证。
+验证基线为 Linux x86_64、4×Tesla T10 16GB（SM75）、Python 3.12、驱动 595.91.07、CUDA toolkit 13.1、GCC/G++ 13。这些是 0.31 目标机验证时的版本，不是推导出的最低版本。其他驱动组合需另行验证。
 
 本项目不执行系统级驱动/工具链安装。开始前检查：
 
@@ -19,13 +19,10 @@ df -h .
 
 ## 2. 依赖约束与已知冲突
 
-- `runtime.txt` 固定主要版本。
-- `observed-constraints.txt` 是已有环境的 201 项分发包版本快照，仅作为依赖解析约束，不携带本机路径、索引凭据或 wheel 文件。
-- `overrides.txt` 将 FlashInfer 明确覆盖为 0.7.0。
-- vLLM 0.30.0 的依赖元数据仍声明 `flashinfer-python==0.6.18.post1`，因此直接运行 `uv pip check` 会报告这一项冲突。
-- `scripts/check_environment.py` 只豁免这个准确的版本组合，其他依赖冲突仍失败。
-
-该覆盖来自原部署的实际运行方案，不是官方认证兼容矩阵。请勿把“检查脚本允许”解释成“上游依赖已经没有冲突”。
+- `runtime.txt` 固定主要版本；flashinfer-cubin 以带 SHA256 的官方发布 wheel 固定。
+- `observed-constraints.txt` 是目标机 0.31 venv 的 204 项分发包版本快照，仅作为依赖解析约束，不携带本机路径、索引凭据或 wheel 文件。
+- `overrides.txt` 固定 `flashinfer-python==0.7.0.post1`，与 vLLM 0.31 元数据要求一致；**0.31 基线没有依赖偏离**。
+- `scripts/check_environment.py` 不豁免任何版本组合，任何依赖冲突或主版本偏离都直接失败。
 
 快照不含 wheel 哈希，也不保证未来索引仍保留所有构建包。需要供应链可重现性时，应另行建立经过许可的内部 wheel 镜像及哈希清单；本仓库不会上传二进制依赖。
 

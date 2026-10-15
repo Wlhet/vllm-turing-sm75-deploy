@@ -287,6 +287,82 @@ def _ple_host_gather() -> bool:
     )
 
 
+def _firefly_skillet() -> bool:
+    """VLLM_FIREFLY_SKILLET 归一化: 默认关; '1'/'on'/'true'/'yes' 开。
+
+    开 = NVFP4 的 decode(小 M) 走 firefly Skillet (自研 m16n8k8 fp16 tensor-core
+    decode GEMM, SM75): 加载期 prepack 把权重 E2M1 nibble 重排成 mma B 操作数
+    fragment 顺序 (codes) + 把 E4M3×global 预解成 fp16 per-group scale (scales),
+    decode 时权重 E2M1 寄存器现解、乘预解 fp16 scale 直接进 m16n8k8 mma, 消除上游
+    Marlin 每 step 的 E4M3 位解码 (那是 NVFP4 比 W4A16 慢 ~10 tok/s 的真因)。
+
+    Skillet 参考了公开的 skinny-GEMV mma 思路但完全自研: m16n8k8 (SM75 高效 tile,
+    非老架构 m8n8k4) + 独享快照 + prefill unpack 反解。
+
+    **独享快照**: 开时 process_weights_after_loading 只存 Skillet codes+scales,
+    **跳过** marlin int32 repack (省 ~0.5 byte/weight) + **不存** firefly row-major
+    快照; prefill(大 M) 用 unpack 把 codes 精确逆解回行主序 (unpack(prepare(w).
+    codes)==w 逐 byte), 复用现成 nvfp4_to_int8_cached (c_n 单遍) → int8 → cutlass
+    IMMA。每层比基线省 ~0.5 byte/weight, 27B TP4 每卡省 ~3GB+, KV 可涨。
+
+    **改编译图 (开/关选不同 custom op: _ff_nvfp4_skillet_linear vs
+    _ff_nvfp4_hybrid_linear), 绝不 pop 出 compile_factors** —— op 选择在 apply_weights
+    (被 torch.compile trace) 里, 开/关是不同编译图; pop 会让 on/off 共享 cache hash,
+    开时编的图被关时复用 → 访问不存在的 _sk_codes 崩。需形状满足 N%16==0 / K%16==0
+    (不满足逐层回退 Marlin)。见 kernels/linear/nvfp4/marlin.py decode 分支 +
+    utils/firefly_skillet.py / PLAN-firefly-skillet-decode。
+    """
+    return os.getenv("VLLM_FIREFLY_SKILLET", "").strip().lower() in (
+        "1",
+        "on",
+        "true",
+        "yes",
+    )
+
+
+def _firefly_skillet_spk() -> int:
+    """VLLM_FIREFLY_SKILLET_SPK 归一化: Skillet decode 的 split-K 因子, 默认 8。
+
+    split-K 因子 = gemm block 内 warp 数 (= block 线程数 / 32), 切分 K/16 group。
+    SM75 该 kernel 是**延迟受限** (mma 占 ~3%, 带宽占 ~7%), 非带宽 bound: 增大 spk
+    → 每 block 独立 mma 链更多, 延迟隐藏更好, m=1 (decode) 提速 (T10 实测 gu
+    4352x5120 spk8→spk16 快 30%; dn 1280x17408 快 9%)。取 {2,4,8,16}, 其余值 kernel
+    内回退 8。
+
+    与 VLLM_FIREFLY_SKILLET (bool, 开/关选不同 custom op) 同属**改编译图、不 pop**
+    一类, 但 spk 更细: 是**传给 custom op 的常量**, 选不同 kernel 模板实例 → 改编译
+    图。故**不** pop 出 compile_factors (保留为编译因子), 改 spk 触发重编, 避免旧缓存
+    跑出错误 kernel。仅在 SKILLET 开时才有意义 (SKILLET 关走 Marlin, spk 不读)。
+    """
+    try:
+        v = int(os.getenv("VLLM_FIREFLY_SKILLET_SPK", "8").strip())
+    except ValueError:
+        return 8
+    return v if v in (2, 4, 8, 16) else 8
+
+
+def _firefly_idec_nvfp4() -> bool:
+    """VLLM_FIREFLY_IDEC_NVFP4 归一化: 默认关; '1'/'on'/'true'/'yes' 开。
+
+    开 = NVFP4 的 decode(小 M) 不走 Marlin FP4, 改走 firefly int8 decode:
+    复用 firefly 快照 (uint8 权重 + fp8 group scale + 预计算 c_n) 现反 int8
+    [N,K] 走 cutlass_scaled_mm (SM75 即 IMMA, 2x fp16 TC), 与 prefill 同骨架
+    (utils/firefly_nvfp4.py 的 nvfp4_prefill_linear, c_n 已预计算走单遍 cached
+    反量化)。NVFP4 Marlin decode 比 AWQ Marlin 重 (S0E5M3 两级 scale 解码交织
+    mma 累加), 55529 实测 ~10 tok/s 差距; int8 decode 零新 kernel 零额外显存,
+    直接吃 sm75 int8 加速。纯运行时分支选择 (custom op 内按 M 分, 不改编译图)
+    → pop 出 compile_factors。需 VLLM_FIREFLY_DIRECT 开 (firefly 快照存在) 才
+    生效, 否则该层无快照回退 Marlin。见 kernels/linear/nvfp4/marlin.py decode
+    分支 / PLAN-firefly-skillet-decode。
+    """
+    return os.getenv("VLLM_FIREFLY_IDEC_NVFP4", "").strip().lower() in (
+        "1",
+        "on",
+        "true",
+        "yes",
+    )
+
+
 def _firefly_hc() -> bool:
     """VLLM_FIREFLY_HC 归一化: 默认关; '1'/'on'/'true'/'yes' 开。
 
@@ -402,6 +478,22 @@ EXTENSIONS: dict[str, object] = {
     # 开 = HC 三投影单流 decode 走融合标量 GEMV(sm75, 不用 tl.dot); 改 decode 图内
     # 算子 → 参与编译 hash, 不 pop。见 vllm_firefly_hc.py。
     "VLLM_FIREFLY_HC": _firefly_hc,
+    # firefly NVFP4 decode int8 开关, 默认关(_firefly_idec_nvfp4 归一化)。
+    # 开 = NVFP4 decode(小 M) 走 firefly int8 (复用快照现反 int8 → cutlass IMMA),
+    # 替代 NVFP4 Marlin; 纯运行时分支选择 (custom op 内按 M 分, 不改编译图) →
+    # pop 复用既有生产编译产物。需 FIREFLY_DIRECT 开才有快照。见
+    # kernels/linear/nvfp4/marlin.py decode 分支。
+    "VLLM_FIREFLY_IDEC_NVFP4": _firefly_idec_nvfp4,
+    # firefly Skillet NVFP4 decode mma kernel 开关, 默认关(_firefly_skillet 归一化)。
+    # 开 = NVFP4 decode(小 M) 走自研 m16n8k8 tensor-core GEMM (prepack 预解 E4M3
+    # scale + 独享快照 + prefill unpack 反解), 替代 NVFP4 Marlin decode; 纯运行时
+    # 分支选择 (custom op 内按 M 分, 不改编译图) → pop 复用编译产物。需形状
+    # N%16==0 / K%16==0。见 kernels/linear/nvfp4/marlin.py + utils/firefly_skillet.py。
+    "VLLM_FIREFLY_SKILLET": _firefly_skillet,
+    # Skillet decode split-K 因子 (2/4/8/16, 默认 8)。传 custom op 常量 → 选不同
+    # kernel 模板 → 改编译图, 故**不** pop 出 compile_factors (改 spk 触发重编)。
+    # 仅 SKILLET 开时有意义。见 kernels/linear/nvfp4/marlin.py + firefly_skillet.cu。
+    "VLLM_FIREFLY_SKILLET_SPK": _firefly_skillet_spk,
     # firefly PP deferred-recv 开关, 默认开(_firefly_defer_recv 归一化, 纯开关)。
     # 开 = PP>1 非首 stage 把 irecv 从 execute_model 入口推迟到 forward 前, host
     # 准备与上一 stage GPU 计算重叠(设备顺序不变, 逐 bit 一致); 0 = 入口即收(回退)。
@@ -414,6 +506,28 @@ EXTENSIONS: dict[str, object] = {
     # 可强制覆盖。
     "VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE": lambda: os.getenv(
         "VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE", "auto"
+    ),
+    # ---- QSA SM75 fast prefill (step2/3/4, 单请求) ----
+    # step2 cuBLAS indexer 快路径开关, 默认 0 (fast 版默认 0, entrypoint 显式开 1)。
+    # 开 = 单请求 prefill 的 QSA 打分走 cuBLAS fp16 TC (torch.mm) + 原 _topk, 替代
+    # triton 逐 query 打分; bf16 存储无损升 fp16 打分。混合/decode 恒走 triton。
+    # 纯运行时分支 (custom op 内按 env 分, 不改编译图) → pop 复用编译产物。
+    # 见 ops/qsa_fast_indexer.py + indexer_qsa.py 注入。
+    "VLLM_QSA_FAST_INDEXER": lambda: os.environ.get(
+        "VLLM_QSA_FAST_INDEXER", "0"
+    ),
+    # step3 短 ctx FA2 快路径开关, 默认 1。开 = 单请求 prefill 且 0<ctx<=16K 走
+    # FlashInfer single_prefill (backend=fa2) packed bitmask, 替代 triton sparse
+    # attention。fp8 主 KV 内部无损升 fp16。纯运行时 (attention 后端选择, 非
+    # linear op) → pop 复用编译产物。见 ops/qsa_fast_short_prefill.py + qsa.py gate。
+    "VLLM_QSA_FAST_SHORT_PREFILL": lambda: os.environ.get(
+        "VLLM_QSA_FAST_SHORT_PREFILL", "1"
+    ),
+    # step4 长 ctx FA2 paged 快路径开关, 默认 1。开 = 单请求 prefill 且 16K<ctx
+    # <=262144 走 selected-paged FA2 (4-token 子页), 替代 triton sparse attention。
+    # 纯运行时 → pop 复用编译产物。见 ops/qsa_fast_long_prefill[_fp8].py + qsa.py gate。
+    "VLLM_QSA_FAST_LONG_PREFILL": lambda: os.environ.get(
+        "VLLM_QSA_FAST_LONG_PREFILL", "1"
     ),
 }
 
@@ -453,18 +567,31 @@ def apply() -> None:
             # 复用既有生产编译产物 (getter 实际仍按 env 原值生效)。
             factors.pop("VLLM_PLE_MEM_LAZY", None)
             factors.pop("VLLM_PLE_MEM_FILL_WORKERS", None)
-            # firefly 族三个 env 都是纯运行时选择(权重路径 / 通信 backend / PP
-            # recv 时机), 不改编译图、数值逐 bit 一致; 历史编译签名无对应 key,
-            # pop 掉对齐复用既有生产编译产物(getter 仍按 env 原值生效)。
-            # DIRECT 取代旧 VLLM_FIREFLY(历史签名有该 key): pop 旧 key 避免
-            # 已设旧 env 时 hash 漂移, 新 key 一并 pop。
+            # firefly 族 env 分两类, 判据 = 是否改变 apply_weights (被 torch.compile
+            # trace) 选哪个 custom op:
+            # (a) 不改 op 选择 → 纯运行时, pop 掉复用历史编译产物 (getter 仍按原值生效):
+            #     AR (通信 backend) / DEFER (PP recv 时机) / IDEC_NVFP4 (分支在 op 内部,
+            #     对 dynamo 是黑盒 leaf 不 trace) / TQ (attention KV, 非 linear op 选择)。
+            # (b) **改 op 选择** → 改编译图 → 绝不 pop (开/关各自编图):
+            #     DIRECT / SKILLET (开/关走 _ff_nvfp4_hybrid_linear vs
+            #     _ff_nvfp4_skillet_linear vs 上游 marlin, 不同 op = 不同图)。pop 会让
+            #     on/off 共享同一 cache hash, 开时编的图被关时复用 → 访问不存在的
+            #     _sk_codes/_ff_w AttributeError (T10 SKILLET 1→0 实测踩到)。
+            # VLLM_FIREFLY 是 DIRECT 取代的旧 key, 历史签名有它, pop 掉避免已设旧 env
+            # 时 hash 漂移。
             factors.pop("VLLM_FIREFLY", None)
-            factors.pop("VLLM_FIREFLY_DIRECT", None)
             factors.pop("VLLM_FIREFLY_AR", None)
             factors.pop("VLLM_FIREFLY_DEFER", None)
-            # FIREFLY_TQ 是 tq prefill 路径选择 (FI vs FA2/SDPA), 纯运行时,
-            # 不改编译图 → 同族 pop。
+            factors.pop("VLLM_FIREFLY_IDEC_NVFP4", None)
             factors.pop("VLLM_FIREFLY_TQ", None)
+            # QSA SM75 fast prefill 三开关: 纯运行时分支选择 (custom op 内按 env 分,
+            # 不改 apply_weights 选哪个 op, 也不改 attention 编译图) → 都是新增 env,
+            # 历史编译签名里没有, pop 掉才能与之对齐, 复用既有生产编译产物。getter
+            # 仍按 env 原值生效 (见 EXTENSIONS 注释)。
+            factors.pop("VLLM_QSA_FAST_INDEXER", None)
+            factors.pop("VLLM_QSA_FAST_SHORT_PREFILL", None)
+            factors.pop("VLLM_QSA_FAST_LONG_PREFILL", None)
+            # 注意: VLLM_FIREFLY_DIRECT / VLLM_FIREFLY_SKILLET 在 (b) 类, 刻意**不** pop。
             return factors
 
         _compile_factors_sm75._sm75_wrapped = True  # type: ignore[attr-defined]

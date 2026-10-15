@@ -1143,7 +1143,7 @@
                 <div class="form-group" style="flex: 1.5;">
                     <label for="apiUrl">API 地址</label>
                     <div style="display: flex; gap: 4px; align-items: center;">
-                        <input type="text" id="apiBaseUrl" value="" placeholder="http://127.0.0.1:9055" style="flex: 2; height: 38px; box-sizing: border-box; padding: 0 10px;" oninput="syncApiUrlAndRefreshModels()">
+                        <input type="text" id="apiBaseUrl" value="" placeholder="http://localhost:8000" style="flex: 2; height: 38px; box-sizing: border-box; padding: 0 10px;" oninput="syncApiUrlAndRefreshModels()">
                         <input type="text" id="apiPathSuffix" value="" placeholder="/v1/chat/completions" style="flex: 1.2; height: 38px; box-sizing: border-box; padding: 0 8px; font-size: 13px; color: #555;" oninput="syncApiUrlAndRefreshModels()">
                         <button type="button" id="btnRefreshModels" class="btn-refresh-models" title="刷新模型列表" onclick="refreshModelList()">
                             <span class="refresh-icon">🔄</span>

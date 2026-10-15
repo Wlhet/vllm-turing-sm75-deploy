@@ -107,3 +107,35 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
         "Warmed up Qwen4Exp QSA sparse attention kernels: %s.",
         attention_profiles,
     )
+
+def qwen4_exp_qsa_fa2_warmup(worker: "Worker") -> None:
+    """预热 SM75 短 ctx FA2 kernel (JIT 首编 ~18s, 挪到启动)。"""
+    import os as _os
+    if _os.getenv("VLLM_QSA_FAST_SHORT_PREFILL", "1") != "1":
+        return
+    try:
+        from vllm.platforms import current_platform as _cp
+        if not _cp.is_device_capability(75):
+            return
+        from vllm.models.qwen4_exp.nvidia.ops.qsa_fast_short_prefill \
+            import warmup as _fa2_warmup
+        _fa2_warmup()
+        logger.info("Warmed up SM75 QSA short-ctx FA2 kernel.")
+    except Exception as _e:
+        logger.warning("SM75 QSA FA2 warmup failed (JIT on 1st prefill): %s", _e)
+
+def qwen4_exp_qsa_fa2paged_warmup(worker: "Worker") -> None:
+    """预热 SM75 长 ctx selected-paged FA2 kernel (JIT ~40s, 挪到启动)。"""
+    import os as _os
+    if _os.getenv("VLLM_QSA_FAST_LONG_PREFILL", "1") != "1":
+        return
+    try:
+        from vllm.platforms import current_platform as _cp
+        if not _cp.is_device_capability(75):
+            return
+        from vllm.models.qwen4_exp.nvidia.ops.qsa_fast_long_prefill_fp8 \
+            import warmup as _s4_warmup
+        _s4_warmup()
+        logger.info("Warmed up SM75 QSA long-ctx FA2 paged kernel.")
+    except Exception as _e:
+        logger.warning("SM75 QSA FA2-paged warmup failed (JIT on 1st prefill): %s", _e)

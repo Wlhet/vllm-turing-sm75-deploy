@@ -347,7 +347,6 @@ def warmup_qsa_mqa_paged_decode(
     max_num_batched_tokens: int,
 ) -> tuple[tuple[int, int], ...]:
     """Compile every reachable decode specialization without launching it."""
-
     page_size = k_cache.shape[1]
     page_table_width = page_table.shape[1]
     columns = page_table_width * page_size
@@ -420,6 +419,7 @@ def _prefill_logits(
     page_table: torch.Tensor,
     query_start_loc: torch.Tensor,
     visible_blocks: torch.Tensor,
+    logits_workspace: torch.Tensor,
     max_query_len: int,
     logits_width: int,
     query_offset: int,
@@ -429,27 +429,19 @@ def _prefill_logits(
     assert visible_blocks.shape == (q.shape[0],)
     assert 0 <= query_offset <= query_offset + num_queries <= q.shape[0]
     assert 0 < logits_width <= page_table.shape[1] * k_cache.shape[1]
+    assert logits_workspace.is_contiguous()
+    assert logits_workspace.numel() >= num_queries * logits_width
 
-    logits = torch.empty(
-        (num_queries, logits_width), dtype=torch.float32, device=q.device
+    # slice from pre-allocated workspace
+    logits = logits_workspace[: num_queries * logits_width].view(
+        num_queries, logits_width
     )
-    # 上游档: TILE_R=64/BLOCK_N=64/K_TILES=16。sm75 档降为
-    # TILE_R=16/BLOCK_N=32/K_TILES=8, 算式 (num_warps=4 → 128 线程,
-    # 本模型 NUM_HEADS_PADDED=4, BLOCK_D=128):
-    #   - scores 累加器 [BLOCK_N, TILE_R*4] fp32: 上游档 [64,256]=64 KB
-    #     → 每线程 512 B (128 寄存器) 起步, 叠加 query 寄存器必溢出 255
-    #     上限; sm75 档 [32,64]=8 KB → 每线程 64 B (16 寄存器) 安全。
-    #   - keys tile [BLOCK_N, 128] fp16 STAGES=2 双缓冲: 上游 32 KB /
-    #     sm75 16 KB; query [128, TILE_R*4] fp16 作 dot B 操作数: 上游
-    #     32 KB / sm75 16 KB → sm75 合计 shared ≈ 32 KB + 流水开销 < 64 KB
-    #     上限 (上游档合计 ≈ 64 KB 顶格, 且其 shared 上限 228 KB 本就不紧)。
-    #   - grid 维度: 行 tile 数 64→16 升 4 倍, k tile 数 1024→256 升 4 倍,
-    #     总 program 数 16 倍, 单 program 工作量 1/8 → 总工作量不变, 换取
-    #     更细并行 (sm75 弱单 CTA 吞吐, 靠多 CTA 填 SM)。
-    if current_platform.has_device_capability(80):
-        TILE_R, BLOCK_N, K_TILES = 64, 64, 16
-    else:
-        TILE_R, BLOCK_N, K_TILES = 16, 32, 8
+    # sm75 (64KB shared 上限, 无 bf16): 上游 tile 档在大显存旗舰卡调的
+    # (v0.31.0: fp8 KV → TILE_R=32/num_warps=8, 非 fp8 → TILE_R=64/num_warps=4,
+    # BLOCK_N=64/K_TILES=16 固定), 直接套用会溢出 sm75 shared/寄存器。
+    # 无论 dtype 一律用 sm75 降档 TILE_R=16/BLOCK_N=32/K_TILES=8, STAGES=2/
+    # num_warps=4 (见下方 launch)。算式见文件头 sm75 降档注释。
+    TILE_R, BLOCK_N, K_TILES = 16, 32, 8
     grid = (
         page_table.shape[0],
         triton.cdiv(min(num_queries, max_query_len), TILE_R),
@@ -570,8 +562,8 @@ def qsa_select_paged_decode(
         compress_ratio: Number of logical tokens represented by a cache row.
         decode_query_len: Number of query tokens per request.
         block_indices: Compressed-index output buffer.
-    """
 
+    """
     assert token_topk % compress_ratio == 0
     assert block_indices.shape == (q.shape[0], token_topk // compress_ratio)
     assert decode_query_len > 0 and q.shape[0] % decode_query_len == 0
@@ -644,8 +636,8 @@ def qsa_select_paged_prefill(
         max_query_len: Maximum number of query tokens in one request.
         block_indices: Compressed-index output buffer.
         max_seq_len: Longest context length in the batch this step.
-    """
 
+    """
     assert token_topk % compress_ratio == 0
     assert block_indices.shape == (q.shape[0], token_topk // compress_ratio)
     rows = q.shape[0]
@@ -655,8 +647,13 @@ def qsa_select_paged_prefill(
     logits_width = min(max(64, logits_width), page_table.shape[1] * k_cache.shape[1])
 
     # 按 VLLM_SPARSE_INDEXER_MAX_LOGITS_MB 限制临时 logits 显存, 分块打分。
+    # (v0.31.0) 预分配最坏情况 workspace 防显存碎片 (见上游 #7a877ae3)。
     max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
     rows_per_chunk = max(1, max_logits_bytes // (logits_width * 4))
+
+    budget_bytes = max(max_logits_bytes, page_table.shape[1] * k_cache.shape[1] * 4)
+    logits_workspace = q.new_empty(budget_bytes // 4, dtype=torch.float32)
+
     topk_workspace = torch.empty(
         (_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device
     )
@@ -670,6 +667,7 @@ def qsa_select_paged_prefill(
             page_table,
             query_start_loc,
             visible_blocks,
+            logits_workspace,
             max_query_len,
             logits_width,
             query_offset=query_start,

@@ -18,7 +18,6 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     apply_gptq_marlin_linear,
     marlin_act_int8_process_scales,
     marlin_make_empty,
-    marlin_make_workspace_new,
     marlin_pad_dim,
     marlin_pad_qweight,
     marlin_pad_scales,
@@ -57,7 +56,7 @@ def _ff_hybrid_linear(
     w_q: torch.Tensor,
     w_s_marlin: torch.Tensor,
     w_zp_marlin: torch.Tensor,
-    workspace: torch.Tensor,
+    workspace: torch.Tensor | None,
     input_global_scale: torch.Tensor,
     bias: torch.Tensor,
     w_s_clean: torch.Tensor,
@@ -222,6 +221,8 @@ class MarlinLinearKernel(MPLinearKernel):
         # 只有 hard 模式: 存干净 scale(小, ~0 字节/参数) + 维度; 非对称(AWQ)另存
         # 干净 qzeros(packed, 小, dequant 时解包); 不存 int4 副本, prefill 步现从
         # marlin 布局反回(单权重, 不爆显存)。
+        # (v0.31.0: marlin 不再持有 self.workspace, 走底层持久 workspace 管理器,
+        # apply 时传 None, 见 apply_weights)
         if self._firefly_enabled():
             ws = getattr(layer, self.w_s_name).data.clone()
             if ws.shape[0] != size_n:  # AWQ K 在前 → N 在前
@@ -239,11 +240,6 @@ class MarlinLinearKernel(MPLinearKernel):
                 getattr(layer, self.w_zp_name).data.clone() if c.zero_points else None
             )
             # 只有 hard: 不存干净 int4 副本, prefill 步现从 marlin 布局反回。
-
-        # Allocate marlin workspace, reusing existing storage on reload.
-        self.workspace = marlin_make_workspace_new(
-            device, existing=getattr(self, "workspace", None)
-        )
 
         # Default name since marlin requires empty parameter for zp,
         # TODO: remove this requirement from marlin (allow optional tensors)
@@ -377,7 +373,7 @@ class MarlinLinearKernel(MPLinearKernel):
                 w_q,
                 w_s,
                 w_zp,
-                self.workspace,
+                None,
                 igs_t,
                 bias_t,
                 layer._firefly_ws,
@@ -398,7 +394,7 @@ class MarlinLinearKernel(MPLinearKernel):
             weight=w_q,
             weight_scale=w_s,
             weight_zp=w_zp,  # type: ignore
-            workspace=self.workspace,
+            workspace=None,
             wtype=c.weight_type,
             input_size_per_partition=c.partition_weight_shape[0],
             output_size_per_partition=c.partition_weight_shape[1],
